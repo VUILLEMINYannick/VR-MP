@@ -1,0 +1,696 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>TP Circuits Électriques VR — Mesures Physiques</title>
+  <script src="https://aframe.io/releases/1.6.0/aframe.min.js"></script>
+  <style>body{margin:0}</style>
+</head>
+<body>
+<!-- Canvas cachés utilisés comme textures -->
+<canvas id="oscillo-canvas" width="512" height="400" style="display:none"></canvas>
+<canvas id="gbf-canvas" width="256" height="128" style="display:none"></canvas>
+
+<script>
+// ================================================================
+// TP CIRCUITS ÉLECTRIQUES VR — Mesures Physiques — FEMTO-ST
+// ================================================================
+// Filtre RC passe-bas avec GBF + oscilloscope temps réel
+// RÈGLES Quest 3 :
+//   1) Pas de création dynamique d'entités
+//   2) Pas de tick() sur les entités laser-controls
+//   3) Pas d'événements bouton → polling gamepad
+//   4) renderer.xr.getSession() au lieu de scene.xrSession
+// ================================================================
+
+// ============ LOCOMOTION + GRAB ============
+AFRAME.registerComponent('locomotion', {
+  schema: { speed: { default: 2.5 } },
+  init: function () {
+    this.leftAxis = [0, 0];
+    this.rightAxis = [0, 0];
+    this.direction = new THREE.Vector3();
+    this.rt = new THREE.Vector3();
+    this.mv = new THREE.Vector3();
+    this._grabL = { held: null, oldParent: null, wasPressed: false, origPos: null, origRot: null };
+    this._grabR = { held: null, oldParent: null, wasPressed: false, origPos: null, origRot: null };
+    this._prevHL = null;
+    this._grabCount = 0;
+    this._fc = 0;
+    this._dbg = 'Init OK';
+    this._err = '';
+    this._tmpV = new THREE.Vector3();
+    this._tmpW = new THREE.Vector3();
+    var self = this;
+    setTimeout(function () {
+      var lh = document.querySelector('#left-hand');
+      var rh = document.querySelector('#right-hand');
+      if (lh) lh.addEventListener('thumbstickmoved', function (e) { self.leftAxis = [e.detail.x, e.detail.y]; });
+      if (rh) rh.addEventListener('thumbstickmoved', function (e) { self.rightAxis = [e.detail.x, e.detail.y]; });
+    }, 2000);
+  },
+  _findClosest: function (worldPos) {
+    var objs = document.querySelectorAll('[grabbable]');
+    var closest = null, minD = 1.5;
+    var wp = this._tmpW;
+    for (var i = 0; i < objs.length; i++) {
+      var o = objs[i];
+      if (o.getAttribute('data-grabbed')) continue;
+      o.object3D.getWorldPosition(wp);
+      var dd = worldPos.distanceTo(wp);
+      if (dd < minD) { minD = dd; closest = o; }
+    }
+    return { target: closest, dist: minD };
+  },
+  _processHand: function (handEl, state, gamepad) {
+    var pressed = false;
+    var btnInfo = '';
+    if (gamepad) {
+      try {
+        for (var b = 0; b <= 1 && b < gamepad.buttons.length; b++) {
+          var btn = gamepad.buttons[b];
+          if (btn.pressed || btn.value > 0.5) { pressed = true; btnInfo += (b === 0 ? 'T' : 'G'); }
+        }
+      } catch (e) { this._err = 'BTN:' + e.message; }
+    }
+    if (pressed && !state.wasPressed) {
+      this._grabCount++;
+      var sphere = handEl.querySelector('a-sphere');
+      if (sphere) sphere.setAttribute('color', '#00ff00');
+      if (!state.held) {
+        handEl.object3D.getWorldPosition(this._tmpV);
+        var res = this._findClosest(this._tmpV);
+        if (res.target) {
+          state.origPos = res.target.object3D.position.clone();
+          state.origRot = res.target.object3D.rotation.clone();
+          res.target.setAttribute('data-grabbed', 'true');
+          state.held = res.target;
+          state.oldParent = res.target.parentNode;
+          handEl.object3D.attach(res.target.object3D);
+        }
+      } else {
+        state.oldParent.object3D.attach(state.held.object3D);
+        state.held.object3D.position.copy(state.origPos);
+        state.held.object3D.rotation.copy(state.origRot);
+        state.held.removeAttribute('data-grabbed');
+        state.held = null; state.oldParent = null;
+      }
+    }
+    if (!pressed && state.wasPressed) {
+      var sphere2 = handEl.querySelector('a-sphere');
+      var origColor = (handEl.id === 'left-hand') ? '#ff4444' : '#4444ff';
+      if (sphere2) sphere2.setAttribute('color', origColor);
+      if (state.held) {
+        state.oldParent.object3D.attach(state.held.object3D);
+        state.held.object3D.position.copy(state.origPos);
+        state.held.object3D.rotation.copy(state.origRot);
+        state.held.removeAttribute('data-grabbed');
+        state.held = null; state.oldParent = null;
+      }
+    }
+    state.wasPressed = pressed;
+    return btnInfo;
+  },
+  tick: function (t, dt) {
+    this._fc++;
+    var lx = this.leftAxis[0], ly = this.leftAxis[1];
+    var rx = this.rightAxis[0], ry = this.rightAxis[1];
+    var dz = 0.15;
+    if (dt <= 100) {
+      var cam = this.el.querySelector('[camera]') || this.el.querySelector('a-camera');
+      if (cam && (Math.abs(lx)>dz||Math.abs(ly)>dz||Math.abs(rx)>dz||Math.abs(ry)>dz)) {
+        var spd = this.data.speed * dt / 1000;
+        this.mv.set(0, 0, 0);
+        if (Math.abs(lx)>dz||Math.abs(ly)>dz) {
+          cam.object3D.getWorldDirection(this.direction);
+          this.direction.y = 0; this.direction.normalize();
+          this.rt.crossVectors(this.direction, new THREE.Vector3(0, 1, 0)).normalize();
+          this.mv.addScaledVector(this.direction, ly * spd);
+          this.mv.addScaledVector(this.rt, -lx * spd);
+        }
+        if (Math.abs(ry) > dz) this.mv.y += -ry * spd;
+        if (Math.abs(rx) > dz) this.el.object3D.rotation.y -= rx * 1.5 * dt / 1000;
+        this.el.object3D.position.add(this.mv);
+      }
+    }
+    // Grab logic
+    var gpLeft = null, gpRight = null, gpSource = '';
+    try {
+      var sceneEl = this.el.sceneEl;
+      if (sceneEl && sceneEl.renderer && sceneEl.renderer.xr) {
+        var session = sceneEl.renderer.xr.getSession();
+        if (session && session.inputSources) {
+          for (var j = 0; j < session.inputSources.length; j++) {
+            var src = session.inputSources[j];
+            if (src.gamepad) {
+              if (src.handedness === 'left') gpLeft = src.gamepad;
+              if (src.handedness === 'right') gpRight = src.gamepad;
+            }
+          }
+          gpSource = 'XR:' + session.inputSources.length;
+        }
+      }
+    } catch (e) { this._err = 'XR:' + e.message; }
+    if (!gpLeft && !gpRight) {
+      try {
+        var gps = navigator.getGamepads ? navigator.getGamepads() : null;
+        if (gps) {
+          var found = [];
+          for (var m = 0; m < gps.length; m++) { if (gps[m]) found.push(gps[m]); }
+          if (found.length >= 2) { gpLeft = found[0]; gpRight = found[1]; }
+          else if (found.length === 1) gpRight = found[0];
+        }
+      } catch (e) {}
+    }
+    var leftHand = document.querySelector('#left-hand');
+    var rightHand = document.querySelector('#right-hand');
+    var btnL = '', btnR = '';
+    if (leftHand) btnL = this._processHand(leftHand, this._grabL, gpLeft);
+    if (rightHand) btnR = this._processHand(rightHand, this._grabR, gpRight);
+    // Highlight
+    try {
+      if (!this._grabR.held && rightHand) {
+        rightHand.object3D.getWorldPosition(this._tmpV);
+        var r2 = this._findClosest(this._tmpV);
+        if (this._prevHL && this._prevHL !== r2.target) {
+          var hb = this._prevHL.querySelector('.interactive');
+          if (hb) hb.setAttribute('material', 'opacity: 0.05; transparent: true; side: double');
+        }
+        if (r2.target) {
+          var hb2 = r2.target.querySelector('.interactive');
+          if (hb2) hb2.setAttribute('material', 'opacity: 0.1; transparent: true; color: #88ffaa; side: double');
+        }
+        this._prevHL = r2.target;
+      }
+    } catch (e) {}
+    // Debug HUD
+    if (this._fc % 30 === 0) {
+      try {
+        var d = document.querySelector('#debug-text');
+        if (d) {
+          d.setAttribute('value', gpSource + ' Btn:' + (btnL||'-') + '/' + (btnR||'-') + ' G:' + this._grabCount + (this._err ? '\n' + this._err : ''));
+        }
+      } catch (e) {}
+    }
+  }
+});
+
+AFRAME.registerComponent('grabbable', { init: function () { this.el.classList.add('grabbable'); } });
+
+// ============ SIMULATION CIRCUIT ============
+AFRAME.registerComponent('circuit-sim', {
+  init: function () {
+    // Paramètres du circuit RC passe-bas
+    this.R = 1000;        // 1 kΩ
+    this.C = 100e-9;      // 100 nF
+    this.freq = 500;      // Hz
+    this.amplitude = 5;   // V crête
+    this.fc = 1 / (2 * Math.PI * this.R * this.C); // ≈ 1592 Hz
+
+    // Canvas
+    this.oscCanvas = document.getElementById('oscillo-canvas');
+    this.oscCtx = this.oscCanvas.getContext('2d');
+    this.gbfCanvas = document.getElementById('gbf-canvas');
+    this.gbfCtx = this.gbfCanvas.getContext('2d');
+
+    // Textures Three.js
+    this.oscTexture = null;
+    this.gbfTexture = null;
+    this._fc = 0;
+    this._setup = false;
+
+    this._drawOscilloscope();
+    this._drawGBF();
+  },
+
+  _setupTextures: function () {
+    var oscScreen = document.querySelector('#oscillo-screen');
+    var gbfScreen = document.querySelector('#gbf-screen');
+    if (oscScreen) {
+      var m = oscScreen.getObject3D('mesh');
+      if (m) {
+        this.oscTexture = new THREE.CanvasTexture(this.oscCanvas);
+        m.material = new THREE.MeshBasicMaterial({ map: this.oscTexture });
+      }
+    }
+    if (gbfScreen) {
+      var m2 = gbfScreen.getObject3D('mesh');
+      if (m2) {
+        this.gbfTexture = new THREE.CanvasTexture(this.gbfCanvas);
+        m2.material = new THREE.MeshBasicMaterial({ map: this.gbfTexture });
+      }
+    }
+    if (this.oscTexture && this.gbfTexture) this._setup = true;
+  },
+
+  tick: function (t, dt) {
+    this._fc++;
+    if (!this._setup) {
+      if (this._fc > 30) this._setupTextures();
+      return;
+    }
+
+    // Interaction avec les boutons du GBF
+    var freqKnob = document.querySelector('#freq-knob');
+    var ampKnob = document.querySelector('#amp-knob');
+    var rig = document.querySelector('#rig');
+    if (rig && rig.components.locomotion) {
+      var loc = rig.components.locomotion;
+
+      // Bouton fréquence saisi → joystick gauche change la fréquence
+      if (freqKnob && freqKnob.getAttribute('data-grabbed')) {
+        var ly = loc.leftAxis[1];
+        if (Math.abs(ly) > 0.15) {
+          this.freq = Math.max(10, Math.min(100000, this.freq * (1 + ly * 0.04)));
+        }
+      }
+      // Bouton amplitude saisi → joystick gauche change l'amplitude
+      if (ampKnob && ampKnob.getAttribute('data-grabbed')) {
+        var ly2 = loc.leftAxis[1];
+        if (Math.abs(ly2) > 0.15) {
+          this.amplitude = Math.max(0.1, Math.min(10, this.amplitude + ly2 * 0.05));
+        }
+      }
+    }
+
+    // Mise à jour affichage (tous les 3 frames)
+    if (this._fc % 3 === 0) {
+      this._drawOscilloscope();
+      this._drawGBF();
+      if (this.oscTexture) this.oscTexture.needsUpdate = true;
+      if (this.gbfTexture) this.gbfTexture.needsUpdate = true;
+    }
+  },
+
+  _drawOscilloscope: function () {
+    var ctx = this.oscCtx;
+    var W = 512, H = 400;
+    var f = this.freq;
+    var A = this.amplitude;
+    var RC = this.R * this.C;
+    var w = 2 * Math.PI * f;
+
+    // Fonction de transfert RC passe-bas
+    var gain = 1 / Math.sqrt(1 + Math.pow(w * RC, 2));
+    var phase = -Math.atan(w * RC);
+    var Aout = A * gain;
+
+    // Fond noir-vert
+    ctx.fillStyle = '#0a1a0a';
+    ctx.fillRect(0, 0, W, H);
+
+    // Grille
+    var divX = 10, divY = 8;
+    var dx = W / divX, dy = H / divY;
+    ctx.strokeStyle = '#1a3a1a';
+    ctx.lineWidth = 1;
+    for (var i = 0; i <= divX; i++) {
+      ctx.beginPath(); ctx.moveTo(i * dx, 0); ctx.lineTo(i * dx, H); ctx.stroke();
+    }
+    for (var j = 0; j <= divY; j++) {
+      ctx.beginPath(); ctx.moveTo(0, j * dy); ctx.lineTo(W, j * dy); ctx.stroke();
+    }
+    // Axes centraux plus visibles
+    ctx.strokeStyle = '#2a5a2a';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(0, H / 2); ctx.lineTo(W, H / 2); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(W / 2, 0); ctx.lineTo(W / 2, H); ctx.stroke();
+
+    // Graduations sur l'axe central
+    ctx.strokeStyle = '#3a6a3a';
+    for (var g = 0; g < divX; g++) {
+      for (var sg = 1; sg < 5; sg++) {
+        var gx = g * dx + sg * dx / 5;
+        ctx.beginPath(); ctx.moveTo(gx, H / 2 - 3); ctx.lineTo(gx, H / 2 + 3); ctx.stroke();
+      }
+    }
+
+    // Échelle auto : 3 périodes visibles
+    var period = 1 / f;
+    var totalTime = period * 3;
+    var pixPerSec = W / totalTime;
+    var maxV = Math.max(A, 1) * 1.3;
+    var pixPerV = (H / 2) / maxV;
+
+    // CH1 — Signal d'entrée (jaune)
+    ctx.strokeStyle = '#ffff00';
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    for (var x = 0; x < W; x++) {
+      var time = x / pixPerSec;
+      var v1 = A * Math.sin(w * time);
+      var y1 = H / 2 - v1 * pixPerV;
+      if (x === 0) ctx.moveTo(x, y1); else ctx.lineTo(x, y1);
+    }
+    ctx.stroke();
+
+    // CH2 — Signal de sortie filtré (cyan)
+    ctx.strokeStyle = '#00ffff';
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    for (var x2 = 0; x2 < W; x2++) {
+      var time2 = x2 / pixPerSec;
+      var v2 = Aout * Math.sin(w * time2 + phase);
+      var y2 = H / 2 - v2 * pixPerV;
+      if (x2 === 0) ctx.moveTo(x2, y2); else ctx.lineTo(x2, y2);
+    }
+    ctx.stroke();
+
+    // Infos texte
+    ctx.font = 'bold 15px monospace';
+    ctx.fillStyle = '#ffff00';
+    ctx.fillText('CH1 (Ve) = ' + A.toFixed(1) + ' Vpp', 10, 20);
+    ctx.fillStyle = '#00ffff';
+    ctx.fillText('CH2 (Vs) = ' + Aout.toFixed(2) + ' Vpp', 10, 40);
+
+    ctx.font = '13px monospace';
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText('f = ' + this._fmtF(f), 10, 62);
+    ctx.fillText('fc = ' + this._fmtF(this.fc) + '   R=' + (this.R / 1000).toFixed(1) + 'kΩ  C=' + (this.C * 1e9).toFixed(0) + 'nF', 10, 80);
+
+    ctx.fillStyle = '#88ff88';
+    ctx.fillText('Gain = ' + gain.toFixed(3) + '  (' + (20 * Math.log10(gain)).toFixed(1) + ' dB)', 10, 102);
+    ctx.fillText('Phase = ' + (phase * 180 / Math.PI).toFixed(1) + '°', 10, 120);
+
+    // Légende
+    ctx.font = 'bold 14px monospace';
+    ctx.fillStyle = '#ffff00';
+    ctx.fillText('■ CH1 Entree', W - 140, 20);
+    ctx.fillStyle = '#00ffff';
+    ctx.fillText('■ CH2 Sortie', W - 140, 40);
+
+    // Indication f vs fc
+    ctx.font = '12px monospace';
+    if (f < this.fc * 0.5) {
+      ctx.fillStyle = '#88ff88';
+      ctx.fillText('f << fc : signal passe', W - 180, H - 15);
+    } else if (f > this.fc * 2) {
+      ctx.fillStyle = '#ff8888';
+      ctx.fillText('f >> fc : signal attenue', W - 190, H - 15);
+    } else {
+      ctx.fillStyle = '#ffff88';
+      ctx.fillText('f ≈ fc : zone de coupure', W - 200, H - 15);
+    }
+  },
+
+  _drawGBF: function () {
+    var ctx = this.gbfCtx;
+    var W = 256, H = 128;
+
+    ctx.fillStyle = '#1a1a2a';
+    ctx.fillRect(0, 0, W, H);
+    ctx.strokeStyle = '#4444aa';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(1, 1, W - 2, H - 2);
+
+    ctx.font = 'bold 14px monospace';
+    ctx.fillStyle = '#6688ff';
+    ctx.fillText('GBF  -  Generateur', 10, 22);
+
+    ctx.font = 'bold 26px monospace';
+    ctx.fillStyle = '#ff8844';
+    ctx.fillText('f = ' + this._fmtF(this.freq), 10, 60);
+
+    ctx.font = 'bold 20px monospace';
+    ctx.fillStyle = '#ffff44';
+    ctx.fillText('A = ' + this.amplitude.toFixed(1) + ' V', 10, 90);
+
+    ctx.font = '11px monospace';
+    ctx.fillStyle = '#8888aa';
+    ctx.fillText('Saisir bouton + joystick G', 10, 118);
+  },
+
+  _fmtF: function (f) {
+    if (f >= 1000) return (f / 1000).toFixed(1) + ' kHz';
+    return f.toFixed(0) + ' Hz';
+  }
+});
+
+// ============ LED CLIGNOTANTE ============
+AFRAME.registerComponent('blink', {
+  schema: { speed: { default: 2 } },
+  tick: function (t) {
+    var on = Math.sin(t * this.data.speed * 0.001 * Math.PI) > 0;
+    this.el.setAttribute('material', 'emissive', on ? '#00ff00' : '#003300');
+    this.el.setAttribute('material', 'color', on ? '#00ff00' : '#003300');
+  }
+});
+</script>
+
+<a-scene vr-mode-ui="enabled: true" background="color: #2a3040" circuit-sim>
+
+  <!-- ===== ÉCLAIRAGE ===== -->
+  <a-light type="ambient" color="#fff" intensity="1.2"></a-light>
+  <a-light type="directional" position="1 4 2" intensity="0.8"></a-light>
+  <a-light type="point" position="0 3 -2" intensity="1.2"></a-light>
+  <a-light type="point" position="-2 2.5 -1.5" intensity="0.6" color="#ddeeff"></a-light>
+  <a-light type="point" position="2 2.5 -1.5" intensity="0.6" color="#ffeedd"></a-light>
+  <a-light type="hemisphere" color="#aaccff" groundColor="#445566" intensity="0.5"></a-light>
+
+  <!-- ===== SALLE DE TP ===== -->
+  <a-plane position="0 0 0" rotation="-90 0 0" width="12" height="10" color="#445566"></a-plane>
+  <a-plane position="0 4 0" rotation="90 0 0" width="12" height="10" color="#2a3040"></a-plane>
+  <a-plane position="0 2 -5" width="12" height="4" color="#333d4d"></a-plane>
+  <a-plane position="-6 2 0" rotation="0 90 0" width="10" height="4" color="#333d4d"></a-plane>
+  <a-plane position="6 2 0" rotation="0 -90 0" width="10" height="4" color="#333d4d"></a-plane>
+
+  <!-- ===== TABLE DE TP (paillasse) ===== -->
+  <!-- Plateau -->
+  <a-box position="0 0.85 -2" width="3.6" height="0.06" depth="1.2" color="#6b5b4f"
+         material="roughness: 0.9; metalness: 0.1"></a-box>
+  <!-- Pieds -->
+  <a-box position="-1.7 0.42 -1.5" width="0.06" height="0.84" depth="0.06" color="#555"></a-box>
+  <a-box position="1.7 0.42 -1.5" width="0.06" height="0.84" depth="0.06" color="#555"></a-box>
+  <a-box position="-1.7 0.42 -2.5" width="0.06" height="0.84" depth="0.06" color="#555"></a-box>
+  <a-box position="1.7 0.42 -2.5" width="0.06" height="0.84" depth="0.06" color="#555"></a-box>
+
+  <!-- ============================================================ -->
+  <!--                   GBF (à gauche)                              -->
+  <!-- ============================================================ -->
+  <a-entity position="-1.2 0.88 -2">
+    <!-- Boîtier GBF -->
+    <a-box width="0.5" height="0.25" depth="0.35" color="#2a2a3a"
+           material="roughness: 0.6; metalness: 0.3" position="0 0.15 0"></a-box>
+    <!-- Face avant inclinée (panneau) -->
+    <a-box width="0.48" height="0.01" depth="0.33" color="#1a1a2a" position="0 0.28 0"></a-box>
+    <!-- Écran GBF (canvas texture) -->
+    <a-plane id="gbf-screen" width="0.36" height="0.18" position="0 0.29 0.05"
+             rotation="-80 0 0" material="shader: flat; color: #1a1a2a"></a-plane>
+    <!-- LED alimentation -->
+    <a-sphere radius="0.008" position="0.2 0.29 0.14" blink="speed: 1"
+              material="color: #00ff00; emissive: #00ff00; shader: flat"></a-sphere>
+    <!-- Label -->
+    <a-text value="GBF" position="0 0.29 0.17" rotation="-90 0 0" align="center"
+            color="#8888cc" width="0.6"></a-text>
+
+    <!-- Bouton FRÉQUENCE (grabbable) -->
+    <a-entity id="freq-knob" grabbable position="-0.12 0.3 0.15">
+      <a-sphere class="interactive" radius="0.06"
+                material="opacity: 0.05; transparent: true; side: double"></a-sphere>
+      <a-cylinder radius="0.03" height="0.03" color="#dd6622"
+                  material="roughness: 0.3; metalness: 0.5" rotation="90 0 0"></a-cylinder>
+      <a-text value="FREQ" position="0 -0.05 0" align="center" color="#ff8844" width="0.3"></a-text>
+    </a-entity>
+
+    <!-- Bouton AMPLITUDE (grabbable) -->
+    <a-entity id="amp-knob" grabbable position="0.12 0.3 0.15">
+      <a-sphere class="interactive" radius="0.06"
+                material="opacity: 0.05; transparent: true; side: double"></a-sphere>
+      <a-cylinder radius="0.03" height="0.03" color="#22aa44"
+                  material="roughness: 0.3; metalness: 0.5" rotation="90 0 0"></a-cylinder>
+      <a-text value="AMPL" position="0 -0.05 0" align="center" color="#44ff66" width="0.3"></a-text>
+    </a-entity>
+
+    <!-- Bornes de sortie GBF -->
+    <a-cylinder radius="0.012" height="0.03" color="#ff3333" position="-0.1 0.07 0.18"
+                material="metalness: 0.8; roughness: 0.2"></a-cylinder>
+    <a-cylinder radius="0.012" height="0.03" color="#333333" position="0.1 0.07 0.18"
+                material="metalness: 0.8; roughness: 0.2"></a-cylinder>
+  </a-entity>
+
+  <!-- ============================================================ -->
+  <!--              PLATINE (breadboard) au centre                   -->
+  <!-- ============================================================ -->
+  <a-entity position="0 0.88 -2">
+    <!-- Plaque de la platine -->
+    <a-box width="0.6" height="0.025" depth="0.35" color="#e8e0d0" position="0 0.025 0"
+           material="roughness: 0.9"></a-box>
+    <!-- Lignes de trous (décoratives) -->
+    <a-box width="0.55" height="0.003" depth="0.005" color="#ccbb99" position="0 0.04 -0.08"></a-box>
+    <a-box width="0.55" height="0.003" depth="0.005" color="#ccbb99" position="0 0.04 -0.04"></a-box>
+    <a-box width="0.55" height="0.003" depth="0.005" color="#ccbb99" position="0 0.04 0.0"></a-box>
+    <a-box width="0.55" height="0.003" depth="0.005" color="#ccbb99" position="0 0.04 0.04"></a-box>
+    <a-box width="0.55" height="0.003" depth="0.005" color="#ccbb99" position="0 0.04 0.08"></a-box>
+    <!-- Rails +/- -->
+    <a-box width="0.55" height="0.003" depth="0.01" color="#ff6666" position="0 0.04 0.14"></a-box>
+    <a-box width="0.55" height="0.003" depth="0.01" color="#6666ff" position="0 0.04 -0.14"></a-box>
+
+    <!-- === RÉSISTANCE R = 1kΩ === -->
+    <a-entity position="-0.08 0.055 0" rotation="0 0 0">
+      <!-- Corps de la résistance -->
+      <a-cylinder radius="0.012" height="0.14" color="#d4b896" rotation="0 0 90"
+                  material="roughness: 0.8"></a-cylinder>
+      <!-- Bandes de couleur : marron-noir-rouge-or (1kΩ) -->
+      <a-cylinder radius="0.013" height="0.008" color="#884400" rotation="0 0 90" position="-0.04 0 0"></a-cylinder>
+      <a-cylinder radius="0.013" height="0.008" color="#222222" rotation="0 0 90" position="-0.02 0 0"></a-cylinder>
+      <a-cylinder radius="0.013" height="0.008" color="#ff0000" rotation="0 0 90" position="0.0 0 0"></a-cylinder>
+      <a-cylinder radius="0.013" height="0.008" color="#ccaa44" rotation="0 0 90" position="0.03 0 0"></a-cylinder>
+      <!-- Pattes -->
+      <a-cylinder radius="0.003" height="0.04" color="#aaaaaa" position="-0.09 0 0"
+                  rotation="0 0 90" material="metalness: 0.9"></a-cylinder>
+      <a-cylinder radius="0.003" height="0.04" color="#aaaaaa" position="0.09 0 0"
+                  rotation="0 0 90" material="metalness: 0.9"></a-cylinder>
+      <!-- Label -->
+      <a-text value="R = 1 kohm" position="0 0.025 0.02" align="center" color="#ffcc88" width="0.4"></a-text>
+    </a-entity>
+
+    <!-- === CONDENSATEUR C = 100nF === -->
+    <a-entity position="0.12 0.055 0" rotation="0 0 0">
+      <!-- Corps du condensateur (céramique disque) -->
+      <a-cylinder radius="0.02" height="0.008" color="#dd8833" rotation="0 0 0"
+                  material="roughness: 0.7"></a-cylinder>
+      <!-- Marquage -->
+      <a-text value="104" position="0 0.006 0.021" align="center" color="#442200" width="0.15"
+              rotation="0 0 0"></a-text>
+      <!-- Pattes -->
+      <a-cylinder radius="0.003" height="0.06" color="#aaaaaa" position="-0.008 -0.03 0"
+                  material="metalness: 0.9"></a-cylinder>
+      <a-cylinder radius="0.003" height="0.06" color="#aaaaaa" position="0.008 -0.03 0"
+                  material="metalness: 0.9"></a-cylinder>
+      <!-- Label -->
+      <a-text value="C = 100 nF" position="0 0.025 0.03" align="center" color="#ffcc88" width="0.4"></a-text>
+    </a-entity>
+
+    <!-- Label circuit -->
+    <a-text value="Filtre RC Passe-Bas" position="0 0.07 0.19" align="center"
+            color="#ffffff" width="0.6"></a-text>
+    <a-text value="fc = 1592 Hz" position="0 0.05 0.19" align="center"
+            color="#88ff88" width="0.5"></a-text>
+  </a-entity>
+
+  <!-- === FILS DE CONNEXION === -->
+  <!-- Fil GBF → Résistance (rouge) -->
+  <a-cylinder radius="0.004" height="0.45" color="#ff3333" position="-0.6 0.95 -1.95"
+              rotation="0 0 90" material="shader: flat"></a-cylinder>
+  <!-- Fil Résistance → Condensateur (jaune) = point milieu = sortie -->
+  <a-cylinder radius="0.004" height="0.2" color="#ffff33" position="0.02 0.95 -1.95"
+              rotation="0 0 90" material="shader: flat"></a-cylinder>
+  <!-- Fil Condensateur → masse (bleu) -->
+  <a-cylinder radius="0.004" height="0.08" color="#3333ff" position="0.12 0.92 -1.95"
+              material="shader: flat"></a-cylinder>
+  <!-- Fil masse → GBF (noir) -->
+  <a-cylinder radius="0.004" height="0.45" color="#333333" position="-0.6 0.9 -2.05"
+              rotation="0 0 90" material="shader: flat"></a-cylinder>
+  <!-- Fils vers oscillo -->
+  <a-cylinder radius="0.004" height="0.6" color="#ffff33" position="0.6 0.95 -1.92"
+              rotation="0 0 90" material="shader: flat"></a-cylinder>
+  <a-cylinder radius="0.004" height="0.6" color="#333333" position="0.6 0.9 -2.08"
+              rotation="0 0 90" material="shader: flat"></a-cylinder>
+
+  <!-- ============================================================ -->
+  <!--                OSCILLOSCOPE (à droite)                        -->
+  <!-- ============================================================ -->
+  <a-entity position="1.2 0.88 -2">
+    <!-- Boîtier oscilloscope -->
+    <a-box width="0.65" height="0.45" depth="0.35" color="#c8c0b0" position="0 0.25 0"
+           material="roughness: 0.7; metalness: 0.1"></a-box>
+    <!-- Façade foncée autour de l'écran -->
+    <a-box width="0.58" height="0.38" depth="0.01" color="#2a2a2a" position="0 0.27 0.175"></a-box>
+    <!-- ÉCRAN OSCILLOSCOPE (canvas texture) -->
+    <a-plane id="oscillo-screen" width="0.5" height="0.32" position="0 0.28 0.182"
+             material="shader: flat; color: #0a1a0a"></a-plane>
+    <!-- Contour écran -->
+    <a-box width="0.52" height="0.005" depth="0.01" color="#555" position="0 0.44 0.175"></a-box>
+    <a-box width="0.52" height="0.005" depth="0.01" color="#555" position="0 0.12 0.175"></a-box>
+    <a-box width="0.005" height="0.32" depth="0.01" color="#555" position="-0.26 0.28 0.175"></a-box>
+    <a-box width="0.005" height="0.32" depth="0.01" color="#555" position="0.26 0.28 0.175"></a-box>
+    <!-- Label marque -->
+    <a-text value="OSCILLOSCOPE" position="0 0.48 0.18" align="center" color="#666" width="0.5"></a-text>
+    <!-- LED power -->
+    <a-sphere radius="0.006" position="0.27 0.09 0.18" blink="speed: 0.5"
+              material="color: #00ff00; emissive: #00ff00; shader: flat"></a-sphere>
+    <!-- Boutons décoratifs -->
+    <a-cylinder radius="0.015" height="0.015" color="#888" position="0.22 0.09 0.18"
+                rotation="90 0 0" material="metalness: 0.5"></a-cylinder>
+    <a-cylinder radius="0.015" height="0.015" color="#888" position="0.17 0.09 0.18"
+                rotation="90 0 0" material="metalness: 0.5"></a-cylinder>
+    <a-cylinder radius="0.015" height="0.015" color="#888" position="0.12 0.09 0.18"
+                rotation="90 0 0" material="metalness: 0.5"></a-cylinder>
+    <!-- Bornes d'entrée -->
+    <a-cylinder radius="0.012" height="0.03" color="#ffff33" position="-0.15 0.07 0.18"
+                rotation="90 0 0" material="metalness: 0.8"></a-cylinder>
+    <a-text value="CH1" position="-0.15 0.05 0.18" align="center" color="#ffff00" width="0.2"></a-text>
+    <a-cylinder radius="0.012" height="0.03" color="#00ffff" position="-0.05 0.07 0.18"
+                rotation="90 0 0" material="metalness: 0.8"></a-cylinder>
+    <a-text value="CH2" position="-0.05 0.05 0.18" align="center" color="#00ffff" width="0.2"></a-text>
+    <a-cylinder radius="0.012" height="0.03" color="#333333" position="0.05 0.07 0.18"
+                rotation="90 0 0" material="metalness: 0.8"></a-cylinder>
+    <a-text value="GND" position="0.05 0.05 0.18" align="center" color="#aaaaaa" width="0.2"></a-text>
+  </a-entity>
+
+  <!-- ============================================================ -->
+  <!--               SCHÉMA DU CIRCUIT (mural)                       -->
+  <!-- ============================================================ -->
+  <a-plane position="-2.5 2.2 -4.95" width="2.2" height="1.4" color="#ffffff"
+           material="opacity: 0.95"></a-plane>
+  <a-text value="SCHEMA : Filtre RC Passe-Bas\n\n    Ve ──[ R=1kohm ]──┬── Vs\n                      │\n                   [C=100nF]\n                      │\n    GND ──────────────┘\n\n   H(jw) = 1 / (1 + jRCw)\n   fc = 1/(2.pi.RC) = 1592 Hz\n\n   Gain = 1/sqrt(1+(f/fc)^2)\n   Phase = -arctan(f/fc)"
+         position="-2.5 2.2 -4.94" align="center" color="#222222" width="2.0"
+         font="monoid" line-height="52"></a-text>
+
+  <!-- ============================================================ -->
+  <!--             PANNEAU D'INSTRUCTIONS                            -->
+  <!-- ============================================================ -->
+  <a-plane position="2.5 2.2 -4.95" width="2.0" height="1.6" color="#2a3a5a"
+           material="opacity: 0.9"></a-plane>
+  <a-text value="TP CIRCUITS ELECTRIQUES VR\nMesures Physiques — FEMTO-ST\n━━━━━━━━━━━━━━━━━━━━━━━\n\nDEPLACEMENT :\n  Joystick G : avancer/reculer\n  Joystick D : monter + rotation\n\nMANIPULATION :\n  Trigger/Grip : saisir un bouton\n\nCHANGER LA FREQUENCE :\n  1. Saisir le bouton FREQ (orange)\n  2. Joystick gauche haut/bas\n\nCHANGER L AMPLITUDE :\n  1. Saisir le bouton AMPL (vert)\n  2. Joystick gauche haut/bas\n\nObserver l oscilloscope !"
+         position="2.5 2.2 -4.94" align="center" color="#ffffff" width="1.8"
+         line-height="50"></a-text>
+
+  <!-- ============================================================ -->
+  <!--         COMPOSANTS SUPPLÉMENTAIRES (grabbable)                -->
+  <!-- ============================================================ -->
+  <!-- Résistance de rechange sur la table -->
+  <a-entity grabbable position="-0.5 0.95 -1.5">
+    <a-sphere class="interactive" radius="0.06"
+              material="opacity: 0.05; transparent: true; side: double"></a-sphere>
+    <a-cylinder radius="0.012" height="0.1" color="#d4b896" rotation="0 0 90"
+                material="roughness: 0.8"></a-cylinder>
+    <a-cylinder radius="0.013" height="0.006" color="#884400" rotation="0 0 90" position="-0.03 0 0"></a-cylinder>
+    <a-cylinder radius="0.013" height="0.006" color="#222222" rotation="0 0 90" position="-0.01 0 0"></a-cylinder>
+    <a-cylinder radius="0.013" height="0.006" color="#ff0000" rotation="0 0 90" position="0.01 0 0"></a-cylinder>
+    <a-text value="1 kohm" position="0 -0.03 0" align="center" color="#ffcc88" width="0.3"></a-text>
+  </a-entity>
+
+  <!-- Condensateur de rechange -->
+  <a-entity grabbable position="0 0.95 -1.5">
+    <a-sphere class="interactive" radius="0.06"
+              material="opacity: 0.05; transparent: true; side: double"></a-sphere>
+    <a-cylinder radius="0.02" height="0.008" color="#dd8833" material="roughness: 0.7"></a-cylinder>
+    <a-text value="100 nF" position="0 -0.03 0" align="center" color="#ffcc88" width="0.3"></a-text>
+  </a-entity>
+
+  <!-- Condensateur 2 -->
+  <a-entity grabbable position="0.5 0.95 -1.5">
+    <a-sphere class="interactive" radius="0.06"
+              material="opacity: 0.05; transparent: true; side: double"></a-sphere>
+    <a-cylinder radius="0.025" height="0.04" color="#224488" material="roughness: 0.5"></a-cylinder>
+    <a-text value="10 uF" position="0 -0.04 0" align="center" color="#88aaff" width="0.3"></a-text>
+  </a-entity>
+
+  <!-- ===== CAMÉRA + CONTRÔLEURS ===== -->
+  <a-entity id="rig" position="0 0 0" locomotion="speed: 2.5">
+    <a-camera position="0 1.6 0">
+      <a-text id="debug-text" value="Pret." position="0 -0.25 -0.8" align="center"
+              color="#ffff00" width="1.5" material="shader: flat"></a-text>
+    </a-camera>
+    <a-entity id="left-hand" laser-controls="hand: left; model: true">
+      <a-sphere radius="0.05" color="#ff4444" material="shader: flat"></a-sphere>
+    </a-entity>
+    <a-entity id="right-hand" laser-controls="hand: right; model: true">
+      <a-sphere radius="0.05" color="#4444ff" material="shader: flat"></a-sphere>
+    </a-entity>
+  </a-entity>
+
+</a-scene>
+</body>
+</html>
